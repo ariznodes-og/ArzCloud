@@ -1,0 +1,61 @@
+name: Create KVM VPS
+
+on:
+  repository_dispatch:
+    types: [create-vps]
+
+jobs:
+  create-vm:
+    runs-on: self-hosted  # MUST be self-hosted. ubuntu-latest has no /dev/kvm.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install KVM and libvirt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-kvm libvirt-daemon-system virtinst cloud-image-utils
+
+      - name: Create cloud-init user-data
+        run: |
+          cat > user-data <<EOF
+          #cloud-config
+          hostname: arzcloud-vm
+          users:
+            - name: arz
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              ssh_authorized_keys:
+                - ${{ github.event.client_payload.ssh_public_key }}
+          EOF
+
+      - name: Download Ubuntu cloud image and create seed
+        run: |
+          wget -O /tmp/ubuntu.img https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
+          cp /tmp/ubuntu.img /var/lib/libvirt/images/arzcloud-vm.qcow2
+          sudo qemu-img resize /var/lib/libvirt/images/arzcloud-vm.qcow2 20G
+          cloud-localds /var/lib/libvirt/images/arzcloud-seed.iso user-data
+
+      - name: Create the VM
+        run: |
+          sudo virt-install \
+            --name arzcloud-vm \
+            --memory 2048 --vcpus 2 \
+            --disk /var/lib/libvirt/images/arzcloud-vm.qcow2,bus=virtio \
+            --disk /var/lib/libvirt/images/arzcloud-seed.iso,device=cdrom \
+            --import --os-variant ubuntu22.04 \
+            --network network=default,model=virtio \
+            --graphics none --console pty,target_type=serial \
+            --noautoconsole
+
+      - name: Get VM IP
+        id: ip
+        run: |
+          sleep 30
+          IP=$(sudo virsh domifaddr arzcloud-vm | awk '/ipv4/ {print $4}' | cut -d/ -f1)
+          echo "vm_ip=$IP" >> $GITHUB_OUTPUT
+
+      - name: Report back to website
+        run: |
+          curl -X POST "${{ secrets.WEBSITE_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\":\"created\",\"vm_ip\":\"${{ steps.ip.outputs.vm_ip }}\"}"
